@@ -1,0 +1,27 @@
+# qai configuration - ~/.config/qai/config
+# KEY=value, one per line. This file is read by qai (Python), never sourced by bash.
+
+# Qube running the AI
+VM=ai-llm
+
+# Command in the AI qube. The prompt is sent on stdin.
+LLM=~/llm/bin/llm
+MODEL=deepseek-flash
+LLM_OPTIONS=-o show_reasoning false
+
+# Limits for each command's output sent to the AI.
+# Over MAX_BYTES: send first and last MAX_BYTES/2 with a note about the missing middle.
+MAX_LINES=300
+MAX_BYTES=6144
+
+# Seconds to wait for the answer, and max size of the answer.
+TIMEOUT=120
+MAX_RESPONSE_BYTES=65536
+
+# Override the system prompt sent when a new session starts. The built-in
+# default answers in the language of your question, and in English when you
+# give no question of your own.
+#SYSTEM_PROMPT=...
+
+# Question used when qai is called without one (built-in default is English).
+#DEFAULT_QUESTION=What is the problem, and how do I fix it?

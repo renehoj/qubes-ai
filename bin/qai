@@ -1,0 +1,322 @@
+#!/usr/bin/python3
+"""qai - send the last command and its output from this terminal to an AI qube.
+
+    qai                      last command + output, default question
+    qai "question"           last command + output + your question
+    qai -n 3 "question"      the last 3 commands
+    qai -q "question"        only the question, no command output
+    qai --new                start a new session (shared by all terminals)
+    qai --dry-run ...        show what would be sent, send nothing
+
+Security model: dom0 starts every exchange with qvm-run. The prompt goes
+to the AI qube on stdin, never inside the command string. The answer is
+treated as untrusted text: it is never executed, and every escape
+sequence and control character is removed before it is printed.
+"""
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import select
+import shlex
+import stat
+import subprocess
+import sys
+import time
+import unicodedata
+
+CONFIG = os.path.expanduser("~/.config/qai/config")
+STATE = os.path.expanduser("~/.local/state/qai")
+SESSION = os.path.join(STATE, "session")
+
+DEFAULTS = {
+    "VM": "ai-llm",
+    "LLM": "~/llm/bin/llm",
+    "MODEL": "deepseek-flash",
+    "LLM_OPTIONS": "-o show_reasoning false",
+    "MAX_LINES": "300",
+    "MAX_BYTES": "6144",
+    "TIMEOUT": "120",
+    "MAX_RESPONSE_BYTES": "65536",
+    "SYSTEM_PROMPT": (
+        "You are helping a user working in a bash terminal in dom0 on "
+        "Qubes OS 4.3. Answer briefly and precisely in plain text without "
+        "markdown. If you suggest commands, explain what they do. "
+        "Answer in the language the user writes their question in. "
+        "If the user gives no question of their own, or its language is "
+        "unclear, answer in English. Do not pick the language from the "
+        "command output."
+    ),
+    "DEFAULT_QUESTION": "What is the problem, and how do I fix it?",
+}
+
+CID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def die(msg, code=1):
+    print(f"qai: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                    value = value[1:-1]
+                cfg[key.strip()] = value
+    except FileNotFoundError:
+        pass
+    for key in ("MAX_LINES", "MAX_BYTES", "TIMEOUT", "MAX_RESPONSE_BYTES"):
+        try:
+            cfg[key] = int(cfg[key])
+        except ValueError:
+            die(f"invalid value for {key} in {CONFIG}")
+    return cfg
+
+
+# --- the terminal buffer from qai-shell -------------------------------------
+
+def load_records():
+    path = os.environ.get("QAI_STATE")
+    if not path:
+        die("this terminal is not running in qai-shell - open a new terminal "
+            "(or use qai -q \"question\")")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        die(f"cannot read {path}: {e.strerror}")
+    with os.fdopen(fd, encoding="utf-8") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            die(f"{path} is not a regular file owned by you")
+        return json.load(f).get("records", [])
+
+
+def trim_output(text, max_lines, max_bytes):
+    lines = text.split("\n")
+    if len(lines) > max_lines:
+        half = max_lines // 2
+        missing = len(lines) - 2 * half
+        lines = (lines[:half]
+                 + [f"[... {missing} lines omitted from the middle ...]"]
+                 + lines[-half:])
+        text = "\n".join(lines)
+    data = text.encode("utf-8")
+    if len(data) > max_bytes:
+        half = max_bytes // 2
+        missing = len(data) - 2 * half
+        head = data[:half].decode("utf-8", "ignore")
+        tail = data[-half:].decode("utf-8", "ignore")
+        text = (f"{head}\n[... {missing} bytes omitted from the middle of the "
+                f"output ...]\n{tail}")
+    return text
+
+
+def build_prompt(records, question, cfg):
+    parts = []
+    for rec in records:
+        output = trim_output(rec["output"], cfg["MAX_LINES"], cfg["MAX_BYTES"])
+        parts.append(
+            f"Command: {rec['command']}\n"
+            f"Exit status: {rec['exit_status']}\n"
+            f"Output:\n{output if output else '(no output)'}\n"
+        )
+    if parts:
+        intro = ("Here is the last command from my terminal:\n\n"
+                 if len(parts) == 1 else
+                 f"Here are the last {len(parts)} commands from my terminal:\n\n")
+        return f"{intro}{chr(10).join(parts)}\nQuestion: {question}\n"
+    return question + "\n"
+
+
+# --- displaying untrusted text -----------------------------------------------
+
+_ESCAPES = re.compile(
+    r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"   # OSC
+    r"|\x1b[P^_X][^\x1b]*(?:\x1b\\)?"        # DCS, PM, APC, SOS
+    r"|\x1b\[[0-?]*[ -/]*[@-~]?"             # CSI
+    r"|\x1b[ -/]*[0-~]?"                     # other ESC sequences
+)
+_BIDI = set("؜‎‏‪‫‬‭‮"
+            "⁦⁧⁨⁩")
+
+
+def sanitize(data):
+    """Make untrusted bytes safe to print: no control chars except \\n and \\t."""
+    text = data.decode("utf-8", errors="replace")
+    text = _ESCAPES.sub("", text).replace("\r\n", "\n")
+    return "".join(
+        ch for ch in text
+        if ch in "\n\t"
+        or (unicodedata.category(ch) != "Cc" and ch not in _BIDI)
+    )
+
+
+# --- talking to the AI qube --------------------------------------------------
+
+def qvm_run(cfg, remote_cmd, stdin_data):
+    """Run a fixed command in the AI qube; return (rc, stdout, stderr)."""
+    proc = subprocess.Popen(
+        ["qvm-run", "--pass-io", cfg["VM"], remote_cmd],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    proc.stdin.write(stdin_data)
+    proc.stdin.close()
+
+    limit = cfg["MAX_RESPONSE_BYTES"]
+    deadline = time.monotonic() + cfg["TIMEOUT"]
+    bufs = {proc.stdout.fileno(): bytearray(), proc.stderr.fileno(): bytearray()}
+    open_fds = list(bufs)
+    truncated = False
+    while open_fds:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            proc.kill()
+            proc.wait()
+            die(f"no answer from {cfg['VM']} within {cfg['TIMEOUT']} seconds")
+        ready, _, _ = select.select(open_fds, [], [], left)
+        for fd in ready:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                open_fds.remove(fd)
+                continue
+            buf = bufs[fd]
+            buf += chunk[:max(0, limit - len(buf))]
+            if len(buf) >= limit:
+                truncated = True
+        if truncated:
+            proc.kill()
+            break
+    rc = proc.wait()
+    out = bytes(bufs[proc.stdout.fileno()])
+    if truncated:
+        out += b"\n[... svaret er afkortet ...]"
+    return rc, out, bytes(bufs[proc.stderr.fileno()])
+
+
+def read_session():
+    try:
+        with open(SESSION, encoding="ascii") as f:
+            cid = f.read().strip()
+    except (FileNotFoundError, UnicodeDecodeError):
+        return None
+    return cid if CID_RE.match(cid) else None
+
+
+def save_session(cid):
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    tmp = SESSION + ".tmp"
+    with open(tmp, "w", encoding="ascii") as f:
+        f.write(cid + "\n")
+    os.replace(tmp, SESSION)
+
+
+def fetch_conversation_id(cfg):
+    """Ask llm in the AI qube for the id of the conversation it just logged."""
+    rc, out, _ = qvm_run(cfg, f"{cfg['LLM']} logs list -n 1 --json", b"")
+    if rc != 0:
+        return None
+    try:
+        rows = json.loads(out.decode("utf-8"))
+        cid = rows[-1]["conversation_id"]
+    except (ValueError, LookupError, TypeError):
+        return None
+    return cid if isinstance(cid, str) and CID_RE.match(cid) else None
+
+
+def ask(cfg, prompt):
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    # Serialise qai calls so two terminals can't both start a new session.
+    with open(os.path.join(STATE, "lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        cid = read_session()
+        cmd = f"{cfg['LLM']} -m {shlex.quote(cfg['MODEL'])} {cfg['LLM_OPTIONS']}"
+        if cid:
+            cmd += f" --cid {shlex.quote(cid)}"
+        elif cfg["SYSTEM_PROMPT"]:
+            cmd += f" -s {shlex.quote(cfg['SYSTEM_PROMPT'])}"
+
+        rc, out, err = qvm_run(cfg, cmd, prompt.encode("utf-8"))
+        if rc != 0:
+            msg = sanitize(err).strip() or sanitize(out).strip()
+            hint = ("\nTry 'qai --new' if the session no longer exists."
+                    if cid and "conversation" in msg.lower() else "")
+            die(f"error from {cfg['VM']} (exit {rc}):\n{msg}{hint}")
+
+        if not cid:
+            new_cid = fetch_conversation_id(cfg)
+            if new_cid:
+                save_session(new_cid)
+            else:
+                print("qai: could not find the conversation id - the next "
+                      "question starts a new session", file=sys.stderr)
+    return sanitize(out)
+
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="qai",
+        description="Send the last command and its output to the AI qube.")
+    p.add_argument("-n", type=int, default=1, metavar="N",
+                   help="send the last N commands (default 1)")
+    p.add_argument("-q", "--question-only", action="store_true",
+                   help="send only the question, no command output")
+    p.add_argument("--new", action="store_true",
+                   help="start a new session")
+    p.add_argument("--dry-run", action="store_true",
+                   help="show what would be sent, but send nothing")
+    p.add_argument("question", nargs="*", help="your question (optional)")
+    args = p.parse_args()
+    cfg = load_config()
+    question = " ".join(args.question).strip()
+
+    if args.new:
+        try:
+            os.unlink(SESSION)
+        except FileNotFoundError:
+            pass
+        print("qai: new session started", file=sys.stderr)
+        if not question and not args.dry_run:
+            return 0
+
+    if args.question_only:
+        if not question:
+            die("-q requires a question")
+        records = []
+    else:
+        if not 1 <= args.n <= 20:
+            die("-n must be between 1 and 20")
+        records = load_records()[-args.n:]
+        if not records:
+            die("no commands in the buffer yet")
+    prompt = build_prompt(records, question or cfg["DEFAULT_QUESTION"], cfg)
+
+    if args.dry_run:
+        print(prompt)
+        return 0
+
+    print(f"qai: sending {len(prompt.encode())} bytes to {cfg['VM']} ...",
+          file=sys.stderr)
+    answer = ask(cfg, prompt).strip("\n")
+    print(f"── answer from {cfg['VM']} " + "─" * 38)
+    print(answer)
+    print("─" * 56)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

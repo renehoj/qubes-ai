@@ -1,0 +1,295 @@
+#!/usr/bin/python3
+"""qai-shell - run bash inside a PTY and remember recent commands and output.
+
+Started from ~/.bashrc in dom0. Everything is passed through to the
+terminal unchanged; on the side, the output stream is cut into
+"command + output" records using the markers emitted by hooks.bash.
+The last records are written to a private file on tmpfs
+($XDG_RUNTIME_DIR), which the `qai` command reads.
+
+This program never talks to any VM. It only buffers.
+"""
+
+import base64
+import errno
+import fcntl
+import json
+import os
+import pty
+import re
+import secrets
+import select
+import signal
+import sys
+import termios
+import time
+import tty
+
+BASH = "/bin/bash"
+HOOKS = os.path.expanduser("~/.local/share/qai/hooks.bash")
+
+MAX_RECORDS = 20
+# Raw bytes kept per command (start and end); qai trims much further.
+RAW_HEAD = 64 * 1024
+RAW_TAIL = 64 * 1024
+
+MARKER = b"\x1b]6973;"
+ALT_SCREEN = re.compile(rb"\x1b\[\?(?:1049|1047|47)([hl])")
+QAI_CMD = re.compile(r"^\s*qai(\s|$)")
+
+
+def state_dir():
+    base = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/qai-{os.getuid()}"
+    path = os.path.join(base, "qai")
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+    return path
+
+
+# --- turning raw terminal output into plain text ---------------------------
+
+_OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_ESC = re.compile(r"\x1b[()*+][0-9A-Za-z]|\x1b[ -/]*[0-~]")
+_CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f\x80-\x9f]")
+
+
+def _overstrike(line):
+    """Apply carriage returns and backspaces like a terminal would."""
+    out = ""
+    for seg in line.split("\r"):
+        buf = []
+        for ch in seg:
+            if ch == "\b":
+                if buf:
+                    buf.pop()
+            else:
+                buf.append(ch)
+        seg = "".join(buf)
+        out = seg + out[len(seg):]
+    return out
+
+
+def to_text(raw):
+    text = raw.decode("utf-8", errors="replace")
+    text = _OSC.sub("", text)
+    text = _CSI.sub("", text)
+    text = _ESC.sub("", text)
+    text = text.replace("\r\n", "\n")
+    lines = [_CTRL.sub("", _overstrike(l)).rstrip() for l in text.split("\n")]
+    return "\n".join(lines).strip("\n")
+
+
+# --- recording ---------------------------------------------------------------
+
+class Recording:
+    def __init__(self):
+        self.head = bytearray()
+        self.tail = bytearray()
+        self.dropped = 0
+        self.in_alt = False
+        self.had_alt = False
+
+    def feed(self, data):
+        pos = 0
+        for m in ALT_SCREEN.finditer(data):
+            if not self.in_alt:
+                self._keep(data[pos:m.start()])
+            entering = m.group(1) == b"h"
+            if entering and not self.in_alt:
+                self.had_alt = True
+                self._keep("\n[full-screen program - output omitted]\n".encode())
+            self.in_alt = entering
+            pos = m.end()
+        if not self.in_alt:
+            self._keep(data[pos:])
+
+    def _keep(self, data):
+        room = RAW_HEAD - len(self.head)
+        if room > 0:
+            self.head += data[:room]
+            data = data[room:]
+        if data:
+            self.tail += data
+            excess = len(self.tail) - RAW_TAIL
+            if excess > 0:
+                del self.tail[:excess]
+                self.dropped += excess
+
+    def text(self):
+        out = to_text(bytes(self.head))
+        if self.tail:
+            if self.dropped:
+                out += f"\n[... {self.dropped} bytes omitted ...]\n"
+            out += to_text(bytes(self.tail))
+        return out
+
+
+class Recorder:
+    def __init__(self, nonce, path):
+        self.nonce = nonce.encode()
+        self.path = path
+        self.pending = b""
+        self.current = None
+        self.last_histnum = None
+        self.records = []
+
+    def feed(self, chunk):
+        data = self.pending + chunk
+        self.pending = b""
+        pos = 0
+        while True:
+            i = data.find(MARKER, pos)
+            if i < 0:
+                break
+            self._output(data[pos:i])
+            j = data.find(b"\x07", i)
+            if j < 0:
+                if len(data) - i < 4096:
+                    self.pending = data[i:]
+                    return
+                self._output(data[i:i + 1])
+                pos = i + 1
+                continue
+            self._marker(data[i + len(MARKER):j])
+            pos = j + 1
+        rest = data[pos:]
+        # Hold back a possible marker prefix split across reads.
+        for n in range(min(len(MARKER) - 1, len(rest)), 0, -1):
+            if MARKER.startswith(rest[-n:]):
+                self.pending = rest[-n:]
+                rest = rest[:-n]
+                break
+        self._output(rest)
+
+    def _output(self, data):
+        if data and self.current is not None:
+            self.current.feed(data)
+
+    def _marker(self, payload):
+        fields = payload.split(b";")
+        if len(fields) < 2 or not secrets.compare_digest(fields[1], self.nonce):
+            return
+        if fields[0] == b"S":
+            self.current = Recording()
+        elif fields[0] == b"E" and len(fields) == 5:
+            try:
+                status = int(fields[2])
+                histnum = int(fields[3])
+                cmd = base64.b64decode(fields[4]).decode("utf-8", "replace")
+            except ValueError:
+                return
+            rec, self.current = self.current, None
+            known = histnum != self.last_histnum
+            self.last_histnum = histnum
+            if rec is None:
+                return
+            if not known:
+                cmd = "(unknown command - not saved in history)"
+            elif QAI_CMD.match(cmd):
+                return
+            self.records.append({
+                "command": cmd,
+                "exit_status": status,
+                "output": rec.text(),
+                "time": int(time.time()),
+            })
+            del self.records[:-MAX_RECORDS]
+            self._save()
+
+    def _save(self):
+        tmp = self.path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"records": self.records}, f)
+        os.replace(tmp, self.path)
+
+
+# --- PTY plumbing ------------------------------------------------------------
+
+def copy_winsize(src_fd, dst_fd):
+    try:
+        size = fcntl.ioctl(src_fd, termios.TIOCGWINSZ, b"\0" * 8)
+        fcntl.ioctl(dst_fd, termios.TIOCSWINSZ, size)
+    except OSError:
+        pass
+
+
+def write_all(fd, data):
+    while data:
+        n = os.write(fd, data)
+        data = data[n:]
+
+
+def selftest():
+    ok = (sys.stdin.isatty() and sys.stdout.isatty()
+          and os.access(BASH, os.X_OK) and os.path.isfile(HOOKS))
+    if ok:
+        state_dir()
+    return 0 if ok else 1
+
+
+def main():
+    if "--selftest" in sys.argv[1:]:
+        return selftest()
+    if os.environ.get("QAI_WRAPPED"):
+        print("qai-shell: already running", file=sys.stderr)
+        return 1
+
+    nonce = secrets.token_hex(12)
+    path = os.path.join(state_dir(), f"shell-{os.getpid()}.json")
+    env = dict(os.environ, QAI_WRAPPED="1", QAI_NONCE=nonce, QAI_STATE=path)
+
+    pid, master = pty.fork()
+    if pid == 0:
+        os.execve(BASH, [BASH], env)
+
+    stdin = sys.stdin.fileno()
+    stdout = sys.stdout.fileno()
+    recorder = Recorder(nonce, path)
+    copy_winsize(stdin, master)
+    signal.signal(signal.SIGWINCH, lambda *_: copy_winsize(stdin, master))
+
+    saved = termios.tcgetattr(stdin)
+    tty.setraw(stdin)
+    fds = [stdin, master]
+    try:
+        while True:
+            try:
+                ready, _, _ = select.select(fds, [], [])
+            except InterruptedError:
+                continue
+            if master in ready:
+                try:
+                    data = os.read(master, 65536)
+                except OSError as e:
+                    if e.errno == errno.EIO:
+                        break
+                    raise
+                if not data:
+                    break
+                write_all(stdout, data)
+                try:
+                    recorder.feed(data)
+                except Exception:
+                    # Recording must never break the user's shell.
+                    recorder.current = None
+            if stdin in ready:
+                data = os.read(stdin, 65536)
+                if data:
+                    write_all(master, data)
+                else:
+                    fds.remove(stdin)
+    finally:
+        termios.tcsetattr(stdin, termios.TCSAFLUSH, saved)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    _, status = os.waitpid(pid, 0)
+    return os.waitstatus_to_exitcode(status) & 0xFF
+
+
+if __name__ == "__main__":
+    sys.exit(main())
