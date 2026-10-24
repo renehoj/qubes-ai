@@ -5,12 +5,27 @@ running in a separate qube (`ai-llm`), and shows the answer as plain text in
 the terminal.
 
 ```
-$ ls /does-not-exist
-ls: cannot access '/does-not-exist': No such file or directory
-$ qai
-qai: sending 210 bytes to ai-llm ...
-── answer from ai-llm ──────────────────────
-...
+$ xl vcpu-list Claude
+Name                                ID  VCPU   CPU State   Time(s) Affinity (Hard / Soft)
+Claude                              12     0    8   -b-     590.7  4-31 / 4-31
+Claude                              12     1    7   -b-     594.2  4-31 / 4-31
+$ qai how do I change the affinity of this domain?
+qai: sending 400 bytes to ai-llm ...
+── answer from ai-llm ──────────────────────────────────────
+To change affinity, use xl vcpu-pin with a cpumask:
+
+  xl vcpu-pin Claude 0 4-7        # pin vCPU 0 to physical CPUs 4 through 7
+  xl vcpu-pin Claude 1 8-11       # pin vCPU 1 to CPUs 8 through 11
+  xl vcpu-pin Claude all 4-15     # same mask for every vCPU of the domain
+
+The cpumask is a list of physical CPU numbers, ranges and comma-separated items allowed, e.g. 4,6,8-15. "all" expands to every vCPU of the domain. Afterwards, re-run xl vcpu-list Claude to confirm the Affinity column.
+
+Caveats:
+- This changes the hard affinity only, live, and is not persistent. Qubes (via libxl) sets cpus/cpus_soft when the VM starts, so the change is lost the next time the VM is shut down or restarted.
+- Qubes does not expose hard/soft affinity in qvm-prefs, so for a permanent setting you need to reapply the pin after each start (e.g. from a script triggered by a VM-start hook or a dom0 login/udev event), or change the VM's CPUs in Qubes' own tools if your goal is just to restrict which CPUs the VM's vCPUs may run on.
+- Soft affinity (the part after the "/" in the Affinity column) cannot be set with xl vcpu-pin; it is only adjustable at domain creation via libxl's cpus_soft.
+────────────────────────────────────────────────────────
+$
 ```
 
 ## Usage
