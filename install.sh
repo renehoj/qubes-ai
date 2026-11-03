@@ -17,6 +17,14 @@ if [[ $EUID -eq 0 ]]; then
     exit 1
 fi
 
+# A .git directory copied from a qube can run code as soon as git is used
+# on it in dom0 (core.fsmonitor, core.pager, hooks ...).
+if [[ -e $src/.git ]]; then
+    echo "This copy contains $src/.git, which must never reach dom0." >&2
+    echo "Remove it without using git:  rm -rf '$src/.git'" >&2
+    exit 1
+fi
+
 remove_block() {
     [[ -f $bashrc ]] || return 0
     sed -i "/^$begin\$/,/^$end\$/d" "$bashrc"
@@ -68,3 +76,4 @@ fi
 EOF
 
 echo "qai is installed. Open a new terminal, run e.g. ls /does-not-exist, then: qai"
+echo "Run 'qai --new' once, so the AI gets the updated system prompt."

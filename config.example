@@ -14,13 +14,18 @@ LLM_OPTIONS=-o show_reasoning false
 MAX_LINES=300
 MAX_BYTES=6144
 
+# Ask before anything is sent (show what will be sent, answer y/N).
+# Set to no to always send at once, or use qai -y for a single call.
+CONFIRM=yes
+
 # Seconds to wait for the answer, and max size of the answer.
 TIMEOUT=120
 MAX_RESPONSE_BYTES=65536
 
 # Override the system prompt sent when a new session starts. The built-in
 # default answers in the language of your question, and in English when you
-# give no question of your own.
+# give no question of your own. It also tells the AI that command output is
+# untrusted data, and to warn before suggesting commands that change dom0.
 #SYSTEM_PROMPT=...
 
 # Question used when qai is called without one (built-in default is English).

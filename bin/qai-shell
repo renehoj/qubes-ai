@@ -20,6 +20,7 @@ import re
 import secrets
 import select
 import signal
+import stat
 import sys
 import termios
 import time
@@ -35,14 +36,32 @@ RAW_TAIL = 64 * 1024
 
 MARKER = b"\x1b]6973;"
 ALT_SCREEN = re.compile(rb"\x1b\[\?(?:1049|1047|47)([hl])")
+_ALT_SEQS = [b"\x1b[?" + n + c for n in (b"1049", b"1047", b"47") for c in (b"h", b"l")]
+MAX_ALT_PREFIX = max(map(len, _ALT_SEQS)) - 1
+# Proper prefixes of the sequences above, to hold back across reads.
+ALT_PREFIXES = {s[:i] for s in _ALT_SEQS for i in range(1, len(s))}
 QAI_CMD = re.compile(r"^\s*qai(\s|$)")
 
 
+def _check_private_dir(path):
+    st = os.lstat(path)
+    if (not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid()
+            or st.st_mode & 0o077):
+        raise RuntimeError(f"{path} is not a private directory owned by you")
+
+
 def state_dir():
-    base = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/qai-{os.getuid()}"
+    # Only the per-user tmpfs; never a shared directory such as /tmp.
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    if not base:
+        raise RuntimeError("XDG_RUNTIME_DIR is not set")
+    _check_private_dir(base)
     path = os.path.join(base, "qai")
-    os.makedirs(path, mode=0o700, exist_ok=True)
-    os.chmod(path, 0o700)
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    _check_private_dir(path)
     return path
 
 
@@ -89,8 +108,18 @@ class Recording:
         self.dropped = 0
         self.in_alt = False
         self.had_alt = False
+        self.pending = b""
 
     def feed(self, data):
+        # Hold back a possible start of an alt-screen sequence split across
+        # reads, so full-screen output is never recorded by mistake.
+        data = self.pending + data
+        self.pending = b""
+        for n in range(min(len(data), MAX_ALT_PREFIX), 0, -1):
+            if data[-n:] in ALT_PREFIXES:
+                self.pending = data[-n:]
+                data = data[:-n]
+                break
         pos = 0
         for m in ALT_SCREEN.finditer(data):
             if not self.in_alt:
@@ -172,11 +201,12 @@ class Recorder:
             return
         if fields[0] == b"S":
             self.current = Recording()
-        elif fields[0] == b"E" and len(fields) == 5:
+        elif fields[0] == b"E" and len(fields) == 6:
             try:
                 status = int(fields[2])
                 histnum = int(fields[3])
-                cmd = base64.b64decode(fields[4]).decode("utf-8", "replace")
+                can_hide = fields[4] == b"1"
+                cmd = base64.b64decode(fields[5]).decode("utf-8", "replace")
             except ValueError:
                 return
             rec, self.current = self.current, None
@@ -184,14 +214,21 @@ class Recorder:
             self.last_histnum = histnum
             if rec is None:
                 return
-            if not known:
-                cmd = "(unknown command - not saved in history)"
-            elif QAI_CMD.match(cmd):
-                return
+            if not known and can_hide:
+                # Possibly hidden on purpose (e.g. a leading space): keep
+                # neither the command nor its output.
+                cmd = "(command not saved in history)"
+                output = "(output not recorded, because the command was not saved in history)"
+            else:
+                # Not in history only because it repeats the previous
+                # command (ignoredups) - which is then the right command.
+                if QAI_CMD.match(cmd):
+                    return
+                output = rec.text()
             self.records.append({
                 "command": cmd,
                 "exit_status": status,
-                "output": rec.text(),
+                "output": output,
                 "time": int(time.time()),
             })
             del self.records[:-MAX_RECORDS]
@@ -199,7 +236,12 @@ class Recorder:
 
     def _save(self):
         tmp = self.path + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600)
         with os.fdopen(fd, "w") as f:
             json.dump({"records": self.records}, f)
         os.replace(tmp, self.path)
@@ -225,7 +267,10 @@ def selftest():
     ok = (sys.stdin.isatty() and sys.stdout.isatty()
           and os.access(BASH, os.X_OK) and os.path.isfile(HOOKS))
     if ok:
-        state_dir()
+        try:
+            state_dir()
+        except (OSError, RuntimeError):
+            ok = False
     return 0 if ok else 1
 
 
